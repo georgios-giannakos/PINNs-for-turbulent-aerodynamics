@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+outputs/
+network_checkpoint*/
+smoke_*/
+*.pth
+*.pt
+*.vtp
+*.npz
+events.out.tfevents.*
+.hydra/
