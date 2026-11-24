@@ -51,7 +51,7 @@ The original near-field weighting convention is preserved: SDF is the minimum of
 | interior_near_field / interior_init | 1.5192284 | 7000 |
 | interior_far_field / interior_init_far_field | 35.9 | 6000 |
 
-These are independently calculated double-precision polygon measures, not measured Warp outputs. Solid area=0.080771642 and maximum thickness=0.11897122. Each sample carries its conditional geometric measure divided by batch size. Area weights implement spatial quadrature and are distinct from PDE lambda weights. Top/bottom totals 2 × 7.5, not a tunable loss multiplier.
+These are independently calculated double-precision polygon measures, not measured Warp outputs. Solid area=0.080771642 and maximum thickness=0.11897122. The NASA TMR page describes the maximum thickness as approximately 0.11894c; evaluating its published coefficients on the 501-point cosine grid gives 0.1189712189c. The preflight now tests this polynomial-derived value directly, without changing the geometry. Each sample carries its conditional geometric measure divided by batch size. Area weights implement spatial quadrature and are distinct from PDE lambda weights. Top/bottom totals 2 × 7.5, not a tunable loss multiplier.
 
 ## Dynamic sampling
 
@@ -106,7 +106,7 @@ At Re=6e6, U=c=rho=1, I=0.001 and nu_t/nu=10, nu=1/6e6, k_inf=1.5e-6, ep_inf=1.2
 
 ## Verification status and limitations
 
-- Independent polygon calculation: complete. Runtime Warp preflight and PhysicsNeMo training: not executed here. The provided preflight checks coordinates, signed distance against an independent NumPy implementation, normals, areas, nondegenerate ranges and cache behavior.
+- Independent polygon calculation: complete. A reported Warp 1.10.0 run on CPU and RTX 4500 Ada passed vertex and measure comparisons, then stopped at the original overly strict thickness assertion. The k-epsilon smoke test reached step 0 with finite loss (39.46). The corrected full preflight, step-1000 cache refresh and NS smoke test remain to be confirmed. The provided preflight checks coordinates, signed distance against an independent NumPy implementation, normals, areas, nondegenerate ranges and cache behavior.
 - A million-step configuration is not proof of convergence or successful completion. Record software versions, seed, commit hash and actual final step.
 - The original finite domain is much smaller than the NASA reference domain. The incompressible PDE formulation also differs from the low-Mach compressible reference. Geometry matching is not full benchmark reproduction.
 - Standard high-Re k-epsilon without wall treatment is not a physically complete near-wall closure. Treat Cf and drag predictions as baseline results, not verified wall-resolved RANS.

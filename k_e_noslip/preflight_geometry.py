@@ -21,7 +21,12 @@ def main():
     area=np.sum((y[1:]+y[:-1])*np.diff(x))
     length=2*np.sum(np.hypot(np.diff(x),np.diff(y)))
     np.testing.assert_allclose(m,[area,length],rtol=2e-5)
-    assert abs(2*max(y)-0.11894)<2e-5
+    # TMR describes the thickness as approximately 0.11894c. Its published
+    # polynomial gives 0.1189712189c on this 501-point cosine grid.
+    # Test the polynomial-derived reference, not the rounded prose value.
+    reference_thickness = 0.11897121886378026
+    np.testing.assert_allclose(2*np.max(y), reference_thickness, atol=1e-9, rtol=0)
+    np.testing.assert_allclose(np.ptp(v[:,1]), reference_thickness, atol=8e-7, rtol=0)
     rng=np.random.default_rng(42)
     q=np.concatenate([rng.uniform([-0.3,-0.49],[1.27,0.49],(1000,2)),[[0.3,0],[-0.002,0],[1.002,0]]])
     a=ref
