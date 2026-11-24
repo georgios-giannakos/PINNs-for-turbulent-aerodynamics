@@ -60,7 +60,7 @@ These are independently calculated double-precision polygon measures, not measur
 
 ![Periodic sampling schedule](figures/resampling.svg)
 
-The solver follows the original ver4 post-inference cache invalidation strategy at steps 1000, 2000, etc. Every constraint has a separate cache and deterministic seed derived from its name and refresh index. Common constraint names use the same seed schedule in NS and k-epsilon. The next batch after the event is new; this is periodic random resampling, not residual-based adaptive sampling. CUDA graphs are disabled and num_workers=0. Only the nominal 0-degree inference group is active in this baseline (near_field_1, boundary_1, far_field_1). The six random inference groups remain commented out for future parametric runs. Inference points are generated before training and remain fixed.
+The solver uses a post-inference cache invalidation strategy at steps 1000, 2000, etc. Every constraint has a separate cache and deterministic seed derived from its name and refresh index. Common constraint names use the same seed schedule in NS and k-epsilon. The next batch after the event is new; this is periodic random resampling, not residual-based adaptive sampling. CUDA graphs are disabled and num_workers=0. Only the nominal 0-degree inference group is active in this baseline (near_field_1, boundary_1, far_field_1). The six random inference groups remain commented out for future parametric runs. Inference points are generated before training and remain fixed.
 
 ## Step-indexed training history
 
@@ -85,7 +85,7 @@ References: [Trainer recording implementation](https://docs.nvidia.com/physicsne
  
 ## Changes from the original repository
 
-Sources: [original Ver1 NS](https://github.com/georgios-giannakos/PINNs/tree/main/models/Ver1/navier-stokes), [original Ver1 k-epsilon](https://github.com/georgios-giannakos/PINNs/tree/main/models/Ver1/k-epsilon), [ver4](https://github.com/georgios-giannakos/PINNs/tree/main/models/ver4). The k-epsilon PDE and executable build on the supplied corrected files. The changes below distinguish those inherited corrections from this release's geometry and sampling work.
+Sources: [original Ver1 NS](https://github.com/georgios-giannakos/PINNs/tree/main/models/Ver1/navier-stokes), [original Ver1 k-epsilon](https://github.com/georgios-giannakos/PINNs/tree/main/models/Ver1/k-epsilon). The k-epsilon PDE and executable build on the supplied corrected files. The changes below distinguish those inherited corrections from this release's geometry and sampling work.
 
 | Component | Original Ver1 | This release | Reason |
 |---|---|---|---|
@@ -98,7 +98,7 @@ Sources: [original Ver1 NS](https://github.com/georgios-giannakos/PINNs/tree/mai
 | Area | Channel boundary/interior measures reused | Actual perimeter, fluid area and exact far area | Correct quadrature |
 | Far init | Absent in original; unfiltered in corrected upload | Common far_criteria | Exclude near region and solid |
 | Far inference | Full rectangle in original NS | Common far_criteria | Match training region |
-| Sampling | Fixed dataset | Online cached batches, 1000-step refresh | Reuse ver4 cadence |
+| Sampling | Fixed dataset | Online cached batches, 1000-step refresh | Periodic collocation refresh |
 | RANS stress (inherited correction) | Scalar diffusion approximation | Symmetric stress divergence and 2/3 grad(k) | Mean static pressure formulation |
 | Turbulence viscosity (inherited) | Large denominator guard | 1e-20 guard | Preserve freestream viscosity ratio |
 | Turbulence outputs (inherited) | Clipped symbolic softplus, floor 1e-4 | Stable scaled PyTorch softplus, floor 1e-12 | Represent small freestream values |

@@ -4,4 +4,6 @@ Thesis research code for steady, two-dimensional incompressible external aerodyn
 
 - [k_e_noslip](k_e_noslip/): standard k-epsilon no-slip baseline and a matched Navier-Stokes comparator with shared NASA TMR geometry.
 
+- [N-S_noslip_corrected](N-S_noslip_corrected/): standalone corrected NVIDIA Navier–Stokes no-slip baseline, matched to the k-epsilon study settings.
+
 Both runs are configured for 1,000,000 steps. Runtime preflight and smoke tests are required before production training; no trained or validated results are claimed.

@@ -1,0 +1,2 @@
+warp-lang==1.10.0
+# Install PhysicsNeMo Sym and compatible PyTorch using NVIDIA's instructions.
