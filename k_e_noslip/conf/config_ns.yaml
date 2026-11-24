@@ -1,0 +1,48 @@
+defaults:
+  - physicsnemo_default
+  - arch:
+      - fully_connected
+  - optimizer: adam
+  - scheduler: tf_exponential_lr
+  - loss: sum
+  - _self_
+arch:
+  fully_connected:
+    arch_type: fully_connected
+    layer_size: 512
+    nr_layers: 6
+    skip_connections: false
+    activation_fn: silu
+    adaptive_activations: false
+    weight_norm: true
+optimizer:
+  lr: 1e-4
+scheduler:
+  decay_rate: 0.95
+  decay_steps: 8000
+training:
+  rec_results_freq: 1000
+  rec_inference_freq: 1000
+  rec_constraint_freq: 10000
+  max_steps: 1000000
+batch_size:
+  inlet: 640
+  outlet: 640
+  top_bot: 640
+  airfoil: 512
+  interior_far_field: 6000
+  interior_near_field: 7000
+cuda_graphs: false
+jit: false
+network_dir: network_checkpoint_ns
+custom:
+  reynolds_number: 6000000.0
+  resample_interval_steps: 1000
+  sampling_seed: 1701
+  airfoil_resolution: 501
+  alpha_min: 0.0
+  alpha_max: 0.0
+  camber_min: 0.0
+  camber_max: 0.0
+  thickness_min: 0.12
+  thickness_max: 0.12
