@@ -9,3 +9,5 @@ smoke_*/
 *.npz
 events.out.tfevents.*
 .hydra/
+
+training_history/

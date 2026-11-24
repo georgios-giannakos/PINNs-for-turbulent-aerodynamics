@@ -388,9 +388,14 @@ def run(cfg: PhysicsNeMoConfig) -> None:
                 "alpha": alpha_inference * np.ones_like(sample_boundary["y"]),
                 "camber": camber_inference * np.ones_like(sample_boundary["y"]),
                 "thickness": thickness_inference * np.ones_like(sample_boundary["y"]),
+                # Retain surface quadrature and fluid-outward normals for drag analysis.
+                "normal_x": sample_boundary["normal_x"],
+                "normal_y": sample_boundary["normal_y"],
+                "area": sample_boundary["area"],
             },
-            output_names=["u", "v", "p", "k", "ep"],
+            output_names=["u", "v", "p", "k", "ep", "u__x", "u__y", "v__x", "v__y"],
             batch_size=n_boundary_points,
+            requires_grad=True,  # Record wall velocity derivatives using AD.
             plotter=InferencerPlotter(),
         )
         domain.add_inferencer(grid_inference, f"boundary_{inferencer_id + 1}")
@@ -416,18 +421,18 @@ def run(cfg: PhysicsNeMoConfig) -> None:
                    camber_inference=(float(cfg.custom.camber_min)+float(cfg.custom.camber_max))/2,
                    thickness_inference=(float(cfg.custom.thickness_min)+float(cfg.custom.thickness_max))/2)
 
-    # Random inferencers
-    rng = np.random.default_rng(42)
+    # Random inferencers (disabled for the single 0-degree baseline).
+    # rng = np.random.default_rng(42)
 
-    for i in range(6):
-        alpha_inference = rng.uniform(float(cfg.custom.alpha_min), float(cfg.custom.alpha_max))
-        camber_inference = rng.uniform(float(cfg.custom.camber_min), float(cfg.custom.camber_max))
-        thickness_inference = rng.uniform(float(cfg.custom.thickness_min), float(cfg.custom.thickness_max))
-        add_inferencer(
-            alpha_inference=alpha_inference,
-            camber_inference=camber_inference,
-            thickness_inference=thickness_inference,
-        )
+    # for i in range(6):
+    #     alpha_inference = rng.uniform(float(cfg.custom.alpha_min), float(cfg.custom.alpha_max))
+    #     camber_inference = rng.uniform(float(cfg.custom.camber_min), float(cfg.custom.camber_max))
+    #     thickness_inference = rng.uniform(float(cfg.custom.thickness_min), float(cfg.custom.thickness_max))
+    #     add_inferencer(
+    #         alpha_inference=alpha_inference,
+    #         camber_inference=camber_inference,
+    #         thickness_inference=thickness_inference,
+    #     )
 
     ##############
     # Solver
