@@ -1,0 +1,488 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from math import log as math_log, expm1
+from sympy import Symbol, Or, Max
+
+import physicsnemo.sym
+from physicsnemo.sym.key import Key
+from physicsnemo.sym.node import Node
+from physicsnemo.sym.hydra import instantiate_arch, PhysicsNeMoConfig
+from physicsnemo.sym.domain import Domain
+from physicsnemo.sym.geometry.primitives_2d import Line, Channel2D
+from physicsnemo.sym.domain.constraint import (
+    PointwiseBoundaryConstraint,
+    PointwiseInteriorConstraint,
+)
+from physicsnemo.sym.geometry import Parameterization, Parameter
+from physicsnemo.sym.domain.inferencer import PointwiseInferencer
+from physicsnemo.sym.domain.monitor import PointwiseMonitor
+from physicsnemo.sym.utils.io import InferencerPlotter
+
+from wall_geometry import WallFunctionGeometry
+from wall_model import WallFunction, NearWallInit, WALL_INPUTS, WALL_OUTPUTS
+from sampling_solver import InferenceScheduledResamplingSolver, sampling_setup
+# Importing the custom k-epsilon models and initialization
+from custom_k_ep_corrected import kEpsilonInit, kEpsilon
+
+
+class PositiveTurbulenceFields(nn.Module):
+    """Smooth, strictly positive k and epsilon for finite NN outputs.
+
+    PyTorch's native softplus is numerically stabilized and differentiable,
+    including its higher-order derivatives required by the PDE nodes.
+    """
+
+    def __init__(self, k_inlet, ep_inlet, floor=1.0e-12):
+        super().__init__()
+        if not (0 < floor < min(k_inlet, ep_inlet)):
+            raise ValueError("Floor must be positive and below both inlet values.")
+        self.floor = float(floor)
+        self.k_scale, self.ep_scale = 1e-3, 1e-2
+        self.k_shift = math_log(expm1((k_inlet-floor)/self.k_scale))
+        self.ep_shift = math_log(expm1((ep_inlet-floor)/self.ep_scale))
+
+    def forward(self, invar):
+        return {
+            "k": self.floor + self.k_scale * F.softplus(invar["k_star"] + self.k_shift),
+            "ep": self.floor + self.ep_scale * F.softplus(invar["ep_star"] + self.ep_shift),
+        }
+
+
+@physicsnemo.sym.main(config_path="conf", config_name="config")
+def run(cfg: PhysicsNeMoConfig) -> None:
+    ##########
+    # Geometry
+    ##########
+
+    x, y = Symbol("x"), Symbol("y")  # Physical coordinates
+
+    # A range of min/max values for the airfoil parameters
+    # fmt: off
+    parameterization = Parameterization({
+        Parameter("alpha"): (float(cfg.custom.alpha_min), float(cfg.custom.alpha_max)),
+        Parameter("camber"): (float(cfg.custom.camber_min), float(cfg.custom.camber_max)),
+        Parameter("thickness"): (float(cfg.custom.thickness_min), float(cfg.custom.thickness_max)),
+    })
+    # fmt: on
+
+    channel_length = 15.0 / 2
+    channel_height = 10.0 / 2
+    x_fraction = 0.3
+
+    channel = Channel2D(
+        (-channel_length * x_fraction, -channel_height / 2),
+        (channel_length * (1 - x_fraction), channel_height / 2),
+    )
+    inlet_geom = Line(
+        (-channel_length * x_fraction, -channel_height / 2),
+        (-channel_length * x_fraction, channel_height / 2),
+        normal=1,
+    )
+    outlet_geom = Line(
+        (channel_length * (1 - x_fraction), -channel_height / 2),
+        (channel_length * (1 - x_fraction), channel_height / 2),
+        normal=1,
+    )
+
+    near_field_channel_length = 1.6
+    near_field_channel_height = 1.0
+    x_fraction_near_field = 0.2
+    near_xmin = -near_field_channel_length * x_fraction_near_field
+    near_xmax = near_field_channel_length * (1 - x_fraction_near_field)
+    near_ymin = -near_field_channel_height / 2
+    near_ymax = near_field_channel_height / 2
+    if any(float(getattr(cfg.custom, key)) != target for key,target in (
+        ("alpha_min",0.), ("alpha_max",0.), ("camber_min",0.),
+        ("camber_max",0.), ("thickness_min",0.12), ("thickness_max",0.12),
+    )):
+        raise ValueError("WF benchmark supports fixed nominal NACA 0012 only.")
+    reynolds_number = float(cfg.custom.reynolds_number)
+    utau_ref = float(cfg.custom.wall_utau_ref)
+    target_yplus = float(cfg.custom.wall_target_yplus)
+    if not (reynolds_number > 0 and utau_ref > 0 and target_yplus > 0):
+        raise ValueError("Positive Re and wall references required.")
+    wall_offset = target_yplus/(reynolds_number*utau_ref)
+    volume_near_field = WallFunctionGeometry(
+        wall_offset=wall_offset,
+        x_min=near_xmin,
+        y_min=near_ymin,
+        x_max=near_xmax,
+        y_max=near_ymax,
+        params=parameterization,
+        include_channel_boundary=False,
+        airfoil_resolution=int(cfg.custom.airfoil_resolution),
+    )
+
+    far_criteria = Or(x <= near_xmin, x >= near_xmax, y <= near_ymin, y >= near_ymax)
+    far_area = channel_length*channel_height-near_field_channel_length*near_field_channel_height
+
+    ###########
+    # Equations
+    ###########
+    u_inlet = 1.0
+    chord = 1.0
+    reynolds_number = float(cfg.custom.reynolds_number)
+    if reynolds_number <= 0:
+        raise ValueError("Reynolds number must be positive.")
+    nu = u_inlet * chord / reynolds_number  # Kinematic viscosity
+
+    # ==========================================
+    # Calculate inlet freestream conditions for k and ep
+    # Using Viscosity Ratio (R_T) approach for consistent physics across Reynolds numbers
+    # ==========================================
+    I = 0.001  # Turbulence Intensity of 0.1% (realistic for external flow/wind tunnels)
+    R_T = 10.0 # Turbulent Viscosity Ratio (mu_t / mu). Best practice: 1 to 10
+    C_mu = 0.09 # Empirical constant from the k-epsilon model, used in calculating ep from k and R_T, Launder & Spalding (1974)
+
+    # 1. Calculate free-stream turbulent kinetic energy (k)
+    k_inlet_val = 1.5 * (u_inlet * I) ** 2
+
+    # 2. Calculate free-stream dissipation rate (ep) based on desired R_T and current nu
+    # Since nu_t = R_T * nu, and nu_t = C_mu * (k^2 / ep)
+    # Therefore: ep = C_mu * k^2 / (R_T * nu)
+    ep_inlet_val = C_mu * (k_inlet_val ** 2) / (R_T * nu)
+
+
+    # Initialize the RANS k-epsilon turbulence model and its initialization phase
+    k_ep_init = kEpsilonInit(u_inlet=u_inlet, k_inlet=k_inlet_val, ep_inlet=ep_inlet_val)
+    k_ep_model = kEpsilon(nu=nu, rho=1.0, k_ref=1e-3, ep_ref=1e-2,
+                          chord=chord, u_ref=u_inlet)
+
+    ###########
+    # Networks
+    ###########
+    # Decoupled architecture: Separate networks for velocity, pressure, and turbulence variables.
+    # This prevents the different scales and gradients from interfering with each other (feature bleed).
+    input_keys_list = [Key("x"), Key("y"), Key("alpha"), Key("camber"), Key("thickness")]
+
+    flow_net = instantiate_arch(
+        input_keys=input_keys_list,
+        output_keys=[Key("u"), Key("v")],
+        cfg=cfg.arch.fully_connected,
+    )
+    p_net = instantiate_arch(
+        input_keys=input_keys_list,
+        output_keys=[Key("p")],
+        cfg=cfg.arch.fully_connected,
+    )
+    
+    # Note: Networks output k_star and ep_star. Positivity constraints are applied below.
+    k_net = instantiate_arch(
+        input_keys=input_keys_list,
+        output_keys=[Key("k_star")],
+        cfg=cfg.arch.fully_connected,
+    )
+    ep_net = instantiate_arch(
+        input_keys=input_keys_list,
+        output_keys=[Key("ep_star")],
+        cfg=cfg.arch.fully_connected,
+    )
+
+    #############
+    # Nodes
+    #############
+    # Native PyTorch softplus avoids symbolic log(2) and Max/Abs lambdify
+    # problems, remains stable for large finite inputs, and preserves higher
+    # derivatives for RANS PDE residuals. At raw outputs 0: k=k_inf, ep=ep_inf.
+    # No k=0 boundary: wall equilibrium couples k to tangential velocity.
+    nodes: list = (
+        k_ep_init.make_nodes()
+        + k_ep_model.make_nodes()
+        + [
+            Node(
+                inputs=["k_star", "ep_star"],
+                outputs=["k", "ep"],
+                evaluate=PositiveTurbulenceFields(
+                    k_inlet_val, ep_inlet_val, floor=1.0e-12
+                ),
+                name="positive_turbulence_fields",
+            )
+        ]
+        + [
+            Node(inputs=WALL_INPUTS, outputs=WALL_OUTPUTS,
+                 evaluate=WallFunction(nu, utau_ref, wall_offset),
+                 name="launder_spalding_wall"),
+            Node(inputs=["u", "v", "p", "k", "ep", "wall_distance",
+                         "wall_normal_x", "wall_normal_y"],
+                 outputs=["u_near_init", "v_near_init", "p_near_init",
+                          "k_near_init", "ep_near_init"],
+                 evaluate=NearWallInit(nu, wall_offset, utau_ref, k_inlet_val,
+                                       ep_inlet_val, float(cfg.custom.wall_init_width)),
+                 name="near_wall_initialization"),
+        ]
+        + [flow_net.make_node(name="flow_network")]
+        + [p_net.make_node(name="p_network")]
+        + [k_net.make_node(name="k_network")]
+        + [ep_net.make_node(name="ep_network")]
+    )
+
+    #############
+    # Constraints
+    #############
+
+    domain = Domain()
+    caches, interval, cached = sampling_setup(cfg)
+
+    # Inlet
+    inlet_bc = PointwiseBoundaryConstraint(
+        nodes=nodes,
+        geometry=cached("inlet", inlet_geom, channel_height),
+        outvar={"u": u_inlet, "v": 0, "k": k_inlet_val, "ep": ep_inlet_val},
+        batch_size=cfg.batch_size.inlet,
+        fixed_dataset=False,
+        num_workers=0,
+        parameterization=parameterization,
+    )
+    domain.add_constraint(inlet_bc, "inlet")
+
+    # Outlet
+    outlet_bc = PointwiseBoundaryConstraint(
+        nodes=nodes,
+        geometry=cached("outlet", outlet_geom, channel_height),
+        outvar={"p": 0},
+        batch_size=cfg.batch_size.outlet,
+        fixed_dataset=False,
+        num_workers=0,
+        parameterization=parameterization,
+    )
+    domain.add_constraint(outlet_bc, "outlet")
+
+    # Freestream (channel top and bottom)
+    top_bot_bc = PointwiseBoundaryConstraint(
+        nodes=nodes,
+        geometry=cached("top_bot", channel, 2*channel_length),
+        outvar={"u": u_inlet, "v": 0, "k": k_inlet_val, "ep": ep_inlet_val},
+        batch_size=cfg.batch_size.top_bot,
+        fixed_dataset=False,
+        num_workers=0,
+        parameterization=parameterization,
+    )
+    domain.add_constraint(top_bot_bc, "top_bot")
+
+    # Four coupled conditions for velocity, k and epsilon at P.
+    wall_keys = ["velocity_wall_normal_wf", "velocity_wall_parallel_wf",
+                 "wall_shear_stress_wf", "ep_wf"]
+    wall_weights = dict(zip(wall_keys, [
+        float(cfg.custom.wall_weight_normal),float(cfg.custom.wall_weight_parallel),
+        float(cfg.custom.wall_weight_shear),float(cfg.custom.wall_weight_ep)]))
+    if not all(np.isfinite(v) and v>0 for v in wall_weights.values()):
+        raise ValueError("Positive finite fixed wall weights required.")
+    airfoil_bc = PointwiseBoundaryConstraint(
+        nodes=nodes, geometry=cached("airfoil", volume_near_field),
+        outvar={key:0 for key in wall_keys}, lambda_weighting=wall_weights,
+        batch_size=cfg.batch_size.airfoil, fixed_dataset=False, num_workers=0,
+        parameterization=parameterization,
+    )
+    domain.add_constraint(airfoil_bc, "airfoil")
+
+    # Interior initialization constraint (helps the RANS model find a stable starting field)
+    interior_init = PointwiseInteriorConstraint(
+        nodes=nodes,
+        geometry=cached("interior_init", volume_near_field),
+        outvar={"u_near_init": 0, "v_near_init": 0, "p_near_init": 0,
+                "k_near_init": 0, "ep_near_init": 0},
+        batch_size=cfg.batch_size.interior_near_field,
+        fixed_dataset=False,
+        num_workers=0,
+        parameterization=parameterization,
+    )
+    domain.add_constraint(interior_init, "interior_init")
+
+    # Matched far initialization.
+    interior_init_far_field = PointwiseInteriorConstraint(
+        nodes=nodes,
+        geometry=cached("interior_init_far_field", channel, far_area),
+        outvar={"u_init": 0, "v_init": 0, "p_init": 0, "k_init": 0, "ep_init": 0},
+        batch_size=cfg.batch_size.interior_far_field,
+        criteria=far_criteria,
+        fixed_dataset=False,
+        num_workers=0,
+        parameterization=parameterization,
+    )
+    domain.add_constraint(interior_init_far_field, "interior_init_far_field")
+
+    # Interior constraints for the far-field: outside the near rectangle.
+    # Use the same Boolean definition for training and far-field inference.
+    interior_far_field = PointwiseInteriorConstraint(
+        nodes=nodes,
+        geometry=cached("interior_far_field", channel, far_area),
+        outvar={"continuity": 0, "momentum_x": 0, "momentum_y": 0, "k_equation": 0, "ep_equation": 0},
+        batch_size=cfg.batch_size.interior_far_field,
+        criteria=far_criteria,
+        fixed_dataset=False,
+        num_workers=0,
+        parameterization=parameterization,
+    )
+    domain.add_constraint(interior_far_field, "interior_far_field")
+
+    # Restore the ORIGINAL near-field SDF residual weighting from k_e_ree6.
+    # Keep physical SDF weighting; omit the unresolved wall layer.
+    interior_near_field = PointwiseInteriorConstraint(
+        nodes=nodes,
+        geometry=cached("interior_near_field", volume_near_field),
+        outvar={"continuity": 0, "momentum_x": 0, "momentum_y": 0, "k_equation": 0, "ep_equation": 0},
+        batch_size=cfg.batch_size.interior_near_field,
+        lambda_weighting={
+            "continuity": 2 * Max(Symbol("sdf"), 0),
+            "momentum_x": 2 * Max(Symbol("sdf"), 0),
+            "momentum_y": 2 * Max(Symbol("sdf"), 0),
+            "k_equation": 2 * Max(Symbol("sdf"), 0),
+            "ep_equation": 2 * Max(Symbol("sdf"), 0),
+        },
+        fixed_dataset=False,
+        num_workers=0,
+        parameterization=parameterization,
+    )
+    domain.add_constraint(interior_near_field, "interior_near_field")
+
+    ##############
+    # Inferencers
+    ##############
+    inferencer_id: int = 0
+
+    def add_inferencer(
+        alpha_inference: float = 0.0,
+        camber_inference: float = 0.0,
+        thickness_inference: float = 0.12,
+        n_interior_points: int = 20000,
+        n_boundary_points: int = 512,
+    ) -> None:
+        """
+        Adds an inferencer to the domain.
+        """
+        nonlocal inferencer_id
+
+        parameterization = Parameterization(
+            {
+                Parameter("alpha"): (alpha_inference, alpha_inference),
+                Parameter("camber"): (camber_inference, camber_inference),
+                Parameter("thickness"): (thickness_inference, thickness_inference),
+            }
+        )
+
+        sample_near_field = volume_near_field.sample_interior(
+            n_interior_points,
+            rand_seed=inferencer_id,
+            parameterization=parameterization,
+        )
+        sample_boundary = volume_near_field.sample_physical_wall(
+            n_boundary_points,
+            rand_seed=inferencer_id,
+            parameterization=parameterization,
+        )
+        sample_far_field = channel.sample_interior(
+            n_interior_points,
+            criteria=far_criteria,
+            quasirandom=True,
+            parameterization=parameterization,
+        )
+        
+        # Output names updated to record turbulent kinetics
+        grid_inference = PointwiseInferencer(
+            nodes=nodes,
+            invar={
+                "x": sample_near_field["x"],
+                "y": sample_near_field["y"],
+                "wall_distance": sample_near_field["wall_distance"],
+                "alpha": alpha_inference * np.ones_like(sample_near_field["y"]),
+                "camber": camber_inference * np.ones_like(sample_near_field["y"]),
+                "thickness": thickness_inference * np.ones_like(sample_near_field["y"]),
+            },
+            output_names=["u", "v", "p", "k", "ep"],
+            batch_size=n_interior_points,
+            plotter=InferencerPlotter(),
+        )
+        domain.add_inferencer(grid_inference, f"near_field_{inferencer_id + 1}")
+
+        grid_inference = PointwiseInferencer(
+            nodes=nodes,
+            # VTP coordinates are P; physical wall coordinates and weights are metadata.
+            invar=sample_boundary,
+            output_names=["u", "v", "p", "k", "ep", "u__x", "u__y", "v__x", "v__y"]
+                         + WALL_OUTPUTS,
+            batch_size=n_boundary_points,
+            requires_grad=True,  # Record wall velocity derivatives using AD.
+            plotter=InferencerPlotter(),
+        )
+        domain.add_inferencer(grid_inference, f"boundary_{inferencer_id + 1}")
+        def rms(name):
+            return lambda var: torch.sqrt(torch.mean(var[name]**2))
+        metrics = {
+            "mean_y_plus": lambda var: var["y_plus_wall"].mean(),
+            "min_y_plus": lambda var: var["y_plus_wall"].min(),
+            "max_y_plus": lambda var: var["y_plus_wall"].max(),
+            "fraction_yplus_below_30": lambda var: (var["y_plus_wall"]<30).float().mean(),
+            "fraction_yplus_above_300": lambda var: (var["y_plus_wall"]>300).float().mean(),
+            "reverse_flow_fraction": lambda var: (var["wall_tangential_velocity"]<0).float().mean(),
+            "mean_k": lambda var: var["k"].mean(),
+            "mean_ep": lambda var: var["ep"].mean(),
+            "mean_utau": lambda var: var["u_tau"].mean(),
+            "mean_cf_signed": lambda var: var["cf_wall"].mean(),
+            **{key+"_rms":rms(key) for key in wall_keys},
+        }
+        domain.add_monitor(PointwiseMonitor(
+            invar=sample_boundary, output_names=["k","ep"]+WALL_OUTPUTS,
+            metrics=metrics, nodes=nodes, requires_grad=True,
+        ), f"wall_diagnostics_{inferencer_id + 1}")
+
+        grid_inference = PointwiseInferencer(
+            nodes=nodes,
+            invar={
+                "x": sample_far_field["x"],
+                "y": sample_far_field["y"],
+                "alpha": alpha_inference * np.ones_like(sample_far_field["y"]),
+                "camber": camber_inference * np.ones_like(sample_far_field["y"]),
+                "thickness": thickness_inference * np.ones_like(sample_far_field["y"]),
+            },
+            output_names=["u", "v", "p", "k", "ep"],
+            batch_size=n_interior_points,
+            plotter=InferencerPlotter(),
+        )
+        domain.add_inferencer(grid_inference, f"far_field_{inferencer_id + 1}")
+
+        inferencer_id += 1
+
+    add_inferencer(alpha_inference=(float(cfg.custom.alpha_min)+float(cfg.custom.alpha_max))/2,
+                   camber_inference=(float(cfg.custom.camber_min)+float(cfg.custom.camber_max))/2,
+                   thickness_inference=(float(cfg.custom.thickness_min)+float(cfg.custom.thickness_max))/2)
+
+    # Random inferencers (disabled for the single 0-degree baseline).
+    # rng = np.random.default_rng(42)
+
+    # for i in range(6):
+    #     alpha_inference = rng.uniform(float(cfg.custom.alpha_min), float(cfg.custom.alpha_max))
+    #     camber_inference = rng.uniform(float(cfg.custom.camber_min), float(cfg.custom.camber_max))
+    #     thickness_inference = rng.uniform(float(cfg.custom.thickness_min), float(cfg.custom.thickness_max))
+    #     add_inferencer(
+    #         alpha_inference=alpha_inference,
+    #         camber_inference=camber_inference,
+    #         thickness_inference=thickness_inference,
+    #     )
+
+    ##############
+    # Solver
+    #############
+    slv = InferenceScheduledResamplingSolver(cfg, domain, caches, interval)
+    slv.solve()
+
+
+if __name__ == "__main__":
+    run()
