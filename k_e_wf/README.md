@@ -26,30 +26,9 @@ python ../tools/archive_training.py -- airfoil_ke_wf.py custom.reynolds_number=1
 
 Smoke tests verify plumbing, not convergence. The common initialization schedule is centered at step 20,000. Check the step-0/1000 archives, new constraint coordinates after refresh, finite losses, VTP fields and monitor CSVs. To continue the same pilot rather than start a fresh production run, retain the pilot directory and all settings except max_steps; verify its optimizer checkpoint step. The shared archive launcher saves snapshots every 50k including step 0, not optimizer/model weights.
 
-## Matched numerical specification
+## Shared numerical framework
 
-| Setting | Value |
-|---|---|
-| Benchmark | NASA TMR NACA 0012, alpha=0, thickness=0.12, camber=0, Re=6e6, U=c=rho=1 |
-| Outer rectangle | x [-2.25,5.25], y [-2.5,2.5] |
-| Near rectangle | x [-0.32,1.28], y [-0.5,0.5] |
-| Networks | Four decoupled fully connected (u,v),p,k_star,ep_star; width 512, 6 layers, SiLU |
-| Optimizer | Adam 1e-4, decay 0.95/8000 |
-| Training | 1M steps; CUDA graphs off, zero workers |
-| Batches | inlet/outlet/top_bot 640, airfoil 512, near 7000, far 6000 |
-| Sampling | Same per-constraint seed and cache refresh every 1000 steps after inference |
-| Recording | inference and monitors 1k, constraints 10k, optional history 50k |
-| Outer BC | u=1,v=0,k_inf,ep_inf at inlet/top/bottom; p=0 at outlet |
-| RANS | Byte-identical complete symmetric stress divergence, mean static p, 2/3 grad(k), fixed k_ref=1e-3, ep_ref=1e-2 |
-| PDE weights | Same far weights and near 2*max(physical SDF,0) |
-
-At Re=6e6, nu=1/6e6, k_inf=1.5e-6, ep_inf=1.215e-7 (I=0.001, viscosity ratio 10). The geometry, RANS PDE, original aggregator, cache and solver files are copied unchanged. Near and wall coordinates necessarily differ because of the unresolved layer.
-
-![Physical geometry](../k_e_noslip/figures/geometry.svg)
-
-![Domain](../k_e_noslip/figures/domain.svg)
-
-![Resampling](../k_e_noslip/figures/resampling.svg)
+The [main README](../README.md) defines the comparison to NVIDIA and Ver1, common geometry, numerical settings, sampling, quadrature and recording. At Re=6e6, nu=1/6e6, k_inf=1.5e-6 and ep_inf=1.215e-7 (I=0.001, viscosity ratio 10). The RANS PDE, original geometry, cache, solver and aggregator are copied unchanged. The four networks, domain, outer BCs, optimizer, batches and training budget match the no-slip RANS baseline. WF differs in the computational wall, near initialization, positive mapping, wall residuals and diagnostics. Near and wall coordinates necessarily differ due to the unresolved layer.
 
 ## Offset geometry
 
@@ -71,6 +50,196 @@ At P: U_t=U dot t, u_tau=C_mu^0.25 sqrt(k), y+=u_tau*d/nu. t points downstream, 
 tau_model = nu*U_t/d * y+/U+ (ratio exactly 1 on linear branch). tau_RANS = t dot [(nu+nu_t)(grad U + grad U^T)] dot (-n). Both are signed kinematic traction on solid. The tangential velocity wall law closes equilibrium k jointly with velocity; stress closes tangential momentum. No additional k-gradient or independent velocity Dirichlet condition is imposed. When the equilibrium residual vanishes, abs(tau_model)=u_tau^2. No physical-wall no-slip or k=0. Relative tangential emphasis is inspired by 22D, not raw copied weights: residual scales differ. Fixed weights are pilot choices, not tuned or validated.
 
 Unlike the inlet-scaled positive mapping in the baseline, shifted stable softplus uses k_scale=1e-3, ep_scale=1e-2, with raw zero still equal to inlet values and floor 1e-12. This allows realistic wall magnitudes without excessively large raw outputs. Initialization aggregator and far initialization are unchanged; near initialization seeds equilibrium-scale k/epsilon and approximately projected tangential velocity, decaying over 0.02c. This is a warm-start heuristic only, not data supervision or a persistent constraint. These two explicit WF-specific numerical changes target the collapse seen in the historical V4; their effectiveness is unverified.
+
+## Detailed wall-treatment methodology
+
+### 1. Geometry and the unresolved layer
+
+![Local offset geometry](figures/wall_offset.svg)
+
+The physical surface W is unchanged. The computational boundary is P = W − d n, with n pointing from the fluid into the solid. The outward-solid normal is −n; t is an orthogonal downstream tangent. The local equilibrium wall treatment replaces the unresolved layer, rather than prescribing a nonzero speed at the physical no-slip surface.
+
+The geometry wrapper translates each polygon segment along its outward-solid normal and closes adjacent translated segments with circular arcs. The offset curve is sampled uniformly in its own arc length. Near-field PDE sampling excludes points with actual distance to the solid D ≤ d. The original near-field SDF (which also includes the horizontal rectangle boundaries) remains the PDE weighting function. The wider auxiliary distance-query rectangle separates true wall distance from those artificial boundaries.
+
+For a convex polygon of area A_s and perimeter L_s, the parallel-body formula gives
+
+$
+A_{\mathrm{resolved}}=A_{\mathrm{rectangle}}-A_s-L_s d-\pi d^2,\qquad L_{\mathrm{offset}}\simeq L_s+2\pi d.
+$
+
+The actual training perimeter is the sum of offset segment lengths and nonnegative vertex-turn arc lengths. The formula is subject to float32 polygon roundoff. Training boundary quadrature uses the offset perimeter; boundary inference uses the original physical perimeter and maps its samples to P.
+
+### 2. Wall distance and local dimensionless variables
+
+With U_inf=c=rho=1, nu=1/Re. The reference y+ and friction velocity select a constant distance, not a prescribed solution:
+
+$
+d/c=\frac{y^+_{\mathrm{ref}}}{Re\,(u_{\tau,\mathrm{ref}}/U_\infty)}.
+$
+
+| Re | Reference y+ | Reference u_tau/U_inf | d/c |
+|---:|---:|---:|---:|
+| 6,000,000 | 80 | 0.04 | 0.000333333 |
+| 1,000,000 | 80 | 0.04 | 0.002 |
+
+At P, the actual quantities depend on the network prediction:
+
+$
+U_t=\mathbf U(P)\cdot\mathbf t,\quad U_n=\mathbf U(P)\cdot\mathbf n,\quad
+u_{\tau,k}=C_\mu^{1/4}\sqrt{k(P)},\quad y^+=u_{\tau,k}d/\nu.
+$
+
+C_mu=0.09. The k-based friction velocity follows the local-equilibrium hypothesis; the independently reported shear-based value is sqrt(abs(tau_model)). They coincide when the equilibrium residual is satisfied. The commonly monitored 30–300 interval is not a constraint; stagnation, separation and low local shear can lead to values outside it.
+
+### 3. Tangential equilibrium wall law
+
+![Implemented wall law](figures/wall_law.svg)
+
+The implemented linear/log Launder–Spalding approximation is
+
+$
+F(y^+)=\begin{cases}
+y^+,&y^+\le y_j^+\\
+\ln(Ey^+)/\kappa,&y^+>y_j^+.
+\end{cases}
+$
+
+Here kappa=0.4187, E=9.793 and the code uses y_j+=11.224708076046031. This is the high intersection of the linear and logarithmic branches (continuous to numerical precision, not differentiable at the join). The unused logarithmic branch is clamped to avoid invalid evaluations in torch.where.
+
+The residual is
+
+$
+r_t=|U_t|-u_{\tau,k}F(y^+).
+$
+
+It couples k and tangential speed instead of imposing an independent fixed velocity at P. Absolute speed permits reversed flow, while the separate signed traction retains its direction. This does not imply that the equilibrium wall law accurately models separation.
+
+### 4. Signed shear and automatic differentiation
+
+The modeled kinematic traction on the solid is
+
+$
+\tau_{\mathrm{model}}=\frac{\nu U_t}{d}\frac{y^+}{F(y^+)}.
+$
+
+The ratio is exactly one in the linear branch. Substituting the equilibrium relation gives tau_model=sign(U_t) u_tau,k². The independent stress predicted by the resolved RANS field uses the full symmetric velocity gradient:
+
+$
+\nu_t=\frac{C_\mu k^2}{\varepsilon+10^{-20}},\quad
+\tau_{\mathrm{RANS}}=-\mathbf t\cdot[(\nu+\nu_t)(\nabla\mathbf U+\nabla\mathbf U^\mathsf T)]\mathbf n.
+$
+
+In components, exactly as implemented:
+
+$
+\tau_{\mathrm{RANS}}=-(\nu+\nu_t)\{t_x[2u_xn_x+(u_y+v_x)n_y]+t_y[(u_y+v_x)n_x+2v_yn_y]\}.
+$
+
+PhysicsNeMo obtains the four first derivatives using automatic differentiation of the velocity network. The minus sign converts the fluid-outward normal into the solid-outward normal. Isotropic pressure and isotropic Reynolds stress cancel in the tangential projection. The residual compares the modeled traction with the full effective stress at P, rather than using molecular viscosity alone or assuming a positive shear direction.
+
+### 5. Epsilon closure
+
+The log-layer equilibrium relation and viscous safeguard are
+
+$
+\varepsilon_{\log}=\frac{C_\mu^{3/4}k^{3/2}}{\kappa d}
+=\frac{u_{\tau,k}^3}{\kappa d},\qquad
+\varepsilon_{\mathrm{visc}}=\frac{2\nu k}{d^2}.
+$
+
+The implementation uses the following exponential blend inspired by OpenFOAM:
+
+$
+\widehat y^+=\operatorname{clamp}(y^+,0,10^4),\qquad
+\Gamma=\frac{0.001(\widehat y^+)^4}{1+\widehat y^+}
+$
+
+$
+\varepsilon_{\mathrm{wall}}=\varepsilon_{\mathrm{visc}}e^{-\Gamma}
++\varepsilon_{\log}e^{-1/(\Gamma+10^{-20})}.
+$
+
+![Dissipation blend factors](figures/epsilon_blend.svg)
+
+These are additive factors, not a convex interpolation whose weights necessarily sum to one. The cap applies only to the blend argument, not to y+ monitoring or a loss penalty. The low-y+ branch is a numerical closure safeguard; it does not turn standard high-Re k–epsilon into a validated low-Re model.
+
+### 6. Coupled wall constraints and loss
+
+![Wall residual dependencies](figures/wall_dependencies.svg)
+
+| Residual | Formula | Fixed lambda |
+|---|---|---:|
+| Normal | U_n | 1 |
+| Tangential equilibrium | abs(U_t) − u_tau,k F(y+) | 10 |
+| Shear | (tau_RANS − tau_model)/u_tau,ref² | 1 |
+| Dissipation | (ep − ep_wall)/(u_tau,ref³/(kappa d_ref)) | 1 |
+
+At the default case the shear normalization is 0.0016 and the epsilon normalization is approximately 0.45856. The velocity residuals already use the nondimensional U_inf=1 convention. The wall objective uses the sampled arc-length weights and fixed lambda multipliers, before the common initialization/physics aggregation. There is no additional k-normal-gradient condition or physical no-slip condition inside the removed layer. Pressure is not prescribed at P.
+
+This is a coupled modeling choice, not a proof of well-posedness or uniqueness. Small k and small tangential speed can still coexist; satisfying wall residuals alone cannot rule out an incorrect flow solution. The fixed weights are initial pilot choices and are not raw copies of historical 22D weights, which used different residual scaling.
+
+### 7. Positive field mapping and near-wall initialization
+
+The no-slip baseline uses an inlet-scaled softplus. The WF mapping retains its inlet value at zero raw output while using wall-scale amplitudes:
+
+$
+q=q_{\min}+s_q\,\operatorname{softplus}(z_q+b_q),\qquad
+b_q=\ln\left[\operatorname{expm1}\left(\frac{q_\infty-q_{\min}}{s_q}\right)\right].
+$
+
+For q=k or epsilon, the floor is 1e-12, s_k=1e-3 and s_ep=1e-2. This enables realistic wall magnitudes without requiring excessively large raw outputs. It does not impose a fixed wall turbulence value.
+
+Let D be the true physical wall distance (D≥d), and n_D its SDF gradient pointing into the fluid. The temporary initialization envelope is
+
+$
+f(D)=\exp[-((D-d)/w)^2],\qquad w=0.02c.
+$
+
+The local seed friction velocity is u_tau,ref abs(n_D,y). The seed k_w is the maximum of its squared value divided by sqrt(C_mu) and k_inf; ep_w is the maximum of the wall epsilon evaluated from k_w at d and ep_inf.
+
+$
+k_0=k_\infty+f(k_w-k_\infty),\qquad
+\varepsilon_0=\varepsilon_\infty+f(\varepsilon_w-\varepsilon_\infty)d/D.
+$
+
+With a=min(1,u_tau,ref F(y_ref+)), the velocity seed is u_0=(1−f)+fa(1−n_D,x²), v_0=−fa n_D,x n_D,y and p_0=0. This is a projected near-wall warm start, not a resolved boundary-layer solution or CFD supervision. The near initialization residuals are u−u_0, v−v_0, p, (k−k_0)/k_0 and (ep−ep_0)/ep_0. Far initialization is identical to the no-slip baseline.
+
+The common tanh aggregator transitions from initialization to physics:
+
+$
+w_{\mathrm{init}}(s)=\tfrac12[1+\tanh(0.0005(20000-s))],\quad
+L=w_{\mathrm{init}}L_{\mathrm{init}}+(1-w_{\mathrm{init}})L_{\mathrm{physics}}.
+$
+
+![Initialization envelope and loss schedule](figures/initialization.svg)
+
+The seed is temporary, not a persistent condition or adaptive loss. These changes address the early turbulence collapse observed in historical V4 (2,000 steps); effectiveness is unverified, and the historical checkpoint does not isolate a single cause.
+
+### 8. Force reconstruction
+
+At inference, W is a physical-wall quadrature point and P is its mapped evaluation point. Approximate p(W) by p(P), and use the modeled wall traction rather than a molecular gradient at W. With the nondimensional reference values:
+
+$
+C_p=2[p(P)-p_\infty],\qquad C_f=2\tau_{\mathrm{model}}.
+$
+
+$
+C_{D,p}=\frac{1}{c}\int_W C_p n_x\,ds,\qquad
+C_{D,f}=\frac{1}{c}\int_W C_f t_x\,ds,\qquad C_D=C_{D,p}+C_{D,f}.
+$
+
+Lift uses n_y and t_y. The postprocessor implements physical arc-length quadrature, not offset perimeter integration. Pressure at P, equilibrium traction and random quadrature introduce uncertainty. Check pressure reference, normal closure, offset sensitivity and quadrature convergence before interpreting absolute drag.
+
+### 9. Pilot acceptance checks
+
+- Geometry: true offset distance, orthogonal unit normals/tangents, no PDE points in the excluded layer, physical and offset measures, deterministic cache renewal.
+- Manufactured wall cases: both signed directions, linear/log branches and finite residual gradients. These establish algebraic checks, not flow validation.
+- Smoke test: graph unrolling, finite losses, VTP variables, monitors and archived outputs. The 1,100-step smoke precedes the physics transition.
+- Pilot through 50k: check inlet, mass conservation, physical stagnation/suction and pressure recovery, velocity acceleration and wake, symmetry, near-zero lift and nontrivial drag.
+- Inspect k, epsilon, y+ distribution, k-derived versus shear-derived friction velocity, signed Cf and individual PDE/BC residuals. Low total loss is not evidence of physical convergence.
+- Compare Cp, Cf, pressure/friction CD and CL to matched models and NASA reference data. Test domain, offset and quadrature sensitivity.
+
+All diagrams here are schematics or analytical evaluations of the implementation, not trained PINN results.
 
 ## Constraints
 

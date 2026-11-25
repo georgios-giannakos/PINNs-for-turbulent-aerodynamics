@@ -16,23 +16,9 @@ For constant density and viscosity, the native PhysicsNeMo NavierStokes PDE impo
 
 These are the incompressible equations on the continuity-satisfying solution; the native symbolic implementation is retained unchanged. With U_inf = c = rho = 1, Re = 6,000,000 and nu = 1/Re. The single fully connected network predicts u, v and p from x, y, alpha, camber and thickness. There is no k, epsilon, eddy viscosity, turbulence initialization or custom initialization aggregator. NS uses the original sum loss from NVIDIA. Consequently, this is a steady no-closure baseline, **not DNS or a physically validated turbulent-flow model** at this Reynolds number.
 
-## Geometry and integration
+## Model-specific differences and constraints
 
-The NASA TMR NACA 0012 analytic profile is
-
-```text
-y/c = +/- 0.594689181 * (0.298222773 sqrt(x/c)
-      - 0.127125232 (x/c) - 0.357907906 (x/c)^2
-      + 0.291984971 (x/c)^3 - 0.105174606 (x/c)^4)
-```
-
-The default nominal thickness parameter is 0.12; evaluating the published polynomial on the 501-point cosine grid gives actual maximum thickness 0.1189712189c. The boundary is approximated by 1,000 polygon segments with exact endpoint closure. Warp calculates signed point-to-segment distance, ray-crossing sign, unit normals and area weights. The boundary normal points out of the fluid (into the solid). Boundary sampling is uniform in polygon arc length; interior sampling rejects solid points while retaining the sampled geometric parameters. Continuous ranges remain available, but only the symmetric nominal 0.12 profile represents the TMR benchmark.
-
-![Leading and trailing edge correction](figures/geometry.svg)
-
-Near-field SDF retains the NVIDIA convention: minimum of signed airfoil distance and the distances to the near rectangle's horizontal boundaries. Artificial vertical interfaces are excluded from SDF weighting. The common far_criteria excludes the near rectangle from far training and inference.
-
-![Computational domain](figures/domain.svg)
+The [main README](../README.md) contains the original NVIDIA comparison table, shared geometry, integration, sampling and history details, including all figures. This standalone NS variant uniquely retains the native NS PDE, six constraints, one network and sum loss. No turbulence fields, initialization, wall offset or wall functions.
 
 | Constraint | Targets | Batch size | Total geometric measure |
 |---|---|---:|---:|
@@ -42,44 +28,6 @@ Near-field SDF retains the NVIDIA convention: minimum of signed airfoil distance
 | airfoil | u=0, v=0 | 512 | 2.039097523 |
 | interior_far_field | continuity, momentum_x, momentum_y = 0 | 6000 | 35.9 |
 | interior_near_field | same three residuals = 0 | 7000 | 1.519228358 |
-
-The near PDE lambda is 2*max(sdf,0), as in NVIDIA and the k-epsilon comparator. Area weights are separate from lambda weights. The listed measures are for the fixed TMR profile, c=1. Solid area is 0.080771642. Top/bottom measure is two lengths of 7.5, not a manually tuned multiplier.
-
-## Changes relative to the NVIDIA upstream example
-
-| Component | NVIDIA upstream | N-S_noslip_corrected |
-|---|---|---|
-| Reynolds number | 50,000 | 6,000,000, configurable |
-| Parameters | alpha -0.2 to 0 rad; camber 0 to 0.2; thickness 0.1 to 0.2 | fixed 0 rad, 0, 0.12 by default; ranges configurable |
-| Profile | NACA polynomial with -0.1036 closure | NASA TMR scaled sharp-TE polynomial |
-| Geometry backend | Warp | Warp retained |
-| SDF | Union of thickness disks | Signed minimum point-to-segment distance |
-| Resolution | 501 uniformly spaced chordwise samples | 501 cosine-spaced vertices per side |
-| Surface samples | Projection from random points | Uniform arc-length sampling |
-| Normals and SDF gradients | Finite differences and rejection of zero components | Guarded segment-distance gradients and valid unit normals |
-| Quadrature | Channel measures reused | Correct polygon perimeter, fluid area and exact far/native measures |
-| Domain | 7.5c x 5c; near 1.6c x 1c | Unchanged |
-| PDE and BCs | Native NS, six constraints, physical no-slip | Unchanged |
-| Near PDE weight | 2*max(sdf,0) | Unchanged |
-| Far inference | Full channel | Shared far_criteria excluding near field |
-| Sampling | Fixed dataset | Independent cached online batches refreshed every 1000 steps |
-| Network | Single fully connected u,v,p network | Same topology; explicit 512-wide, 6-layer SiLU settings matching k-epsilon |
-| Optimizer | Adam, framework default LR | Adam, LR 1e-4 |
-| Scheduler | 0.95 decay per 2000 steps | 0.95 per 8000 steps |
-| Far batch | 7000 | 6000 |
-| Training budget | 1,000,000 | 1,000,000, unchanged |
-| Inference groups | Seven | One active, six random groups commented |
-| Boundary inference | 20,000 points sampled despite 512 batch size; field values only | 512 points; p, velocity gradients, normals and area |
-| Checkpoints | Default framework path | network_checkpoint_ns_noslip_corrected |
-| History | Latest results | Immutable 50,000-step snapshots using shared launcher |
-
-## Dynamic sampling and history
-
-![Periodic sampling](figures/resampling.svg)
-
-The solver invalidates each constraint's cache after inference recording at steps 1000, 2000, etc. The next batch receives a new deterministic seed derived from the constraint name and refresh index. Common NS and k-epsilon constraints use identical seed schedules. This is periodic random resampling, not residual-adaptive refinement. CUDA graphs are disabled and num_workers=0. Inference coordinates are fixed; only near_field_1, boundary_1 and far_field_1 are active.
-
-The shared archive launcher saves matched constraint and inference records at step 0 and every 50,000 steps in the actual network_dir/training_history. Each snapshot contains constraints/, inferencers/, config.yaml and manifest.json with file hashes. Expect 21 snapshots if all scheduled events complete through step 1,000,000. Native constraints are recorded every 10,000 steps and inference every 1,000 steps. Model checkpoints are not archived by this launcher. Use a fresh output path; do not mix histories from independent runs.
 
 Boundary inference records p, u, v, u__x, u__y, v__x, v__y, normal_x, normal_y and area. First derivatives are computed by AD during inference only. With the stored fluid-outward normal n_f, the force on the solid is the negative of fluid boundary traction: p n_f - mu (grad U + grad U^T) n_f. Integrate the x component with area weights and divide by 0.5 rho U_inf^2 c for CD at zero AoA. Pressure and molecular-viscous components can be integrated separately. Absolute drag requires surface quadrature convergence; 512 samples are not a guarantee of sufficient accuracy.
 
