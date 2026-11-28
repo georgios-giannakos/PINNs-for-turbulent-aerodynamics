@@ -1,0 +1,30 @@
+# Fixed TMR NACA0012, alpha=0, c=U=rho=1. NOT a parameterized solver.
+seed: 1701
+device: auto
+dtype: float64
+reynolds: 6000000.0
+intensity: 0.001
+viscosity_ratio: 10.0
+resolution: 1001
+bounds: [-2.25, 5.25, -2.5, 2.5]
+width: 128
+layers: 5
+lr: 0.0001
+lr_min: 0.00001
+max_steps: 200000
+pde_ramp_steps: 10000
+velocity_bc_weight: 10.0
+grad_clip: 10.0
+batch_boundary: 512
+batch_near: 1024
+batch_far: 1024
+batch_layers: 2048
+batch_leading: 512
+batch_wake: 512
+dmin: 0.000001
+dmax: 0.02
+resample_every: 100
+log_every: 100
+record_every: 5000
+inference_points: 20000
+inference_batch: 256

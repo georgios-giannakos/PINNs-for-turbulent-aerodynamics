@@ -1,0 +1,8 @@
+{
+  "unit_tests": 8,
+  "passed": true,
+  "training_steps": 2,
+  "resume_steps": 1,
+  "vtp_files_read_back": 12,
+  "cfd_convergence_validated": false
+}

@@ -1,0 +1,16 @@
+{
+  "date": "2026-11-28",
+  "archive_name": "k_e_noslip.zip",
+  "archive_sha256": "ac891e765da6bc88df648508d0de1dcde710c0563450f8549325ebb40ed74992",
+  "source_commit_audited": "a3fca6eca1a3cc5a1e57b5c3ea257890d49842a9",
+  "run_source_commit_proven": false,
+  "all_manifest_hashes_verified": 55,
+  "nonfinite_array_entries": 0,
+  "inference_files": 15,
+  "constraint_files": 40,
+  "reference_scope": "alpha=0 zone only",
+  "reference_urls": [
+    "https://tmbwg.github.io/turbmodels/NACA0012_validation/n0012cp_cfl3d_sa.dat",
+    "https://tmbwg.github.io/turbmodels/NACA0012_validation/n0012cf_cfl3d_sa.dat"
+  ]
+}
